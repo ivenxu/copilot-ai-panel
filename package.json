@@ -52,12 +52,8 @@
   "extensionPack": [
     "feima.copilot-more-llms"
   ],
-  "extensionDependencies": [
-    "github.copilot-chat"
-  ],
   "activationEvents": [
-    "onLanguageModel:*",
-    "onLanguage:yaml"
+    "onLanguageModel:*"
   ],
   "enabledApiProposals": [
     "chatSessionsProvider",

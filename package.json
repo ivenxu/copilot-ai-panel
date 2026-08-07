@@ -2,7 +2,7 @@
   "name": "copilot-ai-flow",
   "displayName": "AI Flow - Multi-Agent Orchestration",
   "description": "Multi-role AI orchestration in VS Code — pipeline, iterative, & fork-join workflows with built-in flows for code review, sprint planning, and incident response",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "publisher": "feima",
   "license": "MIT",
   "icon": "assets/icon.png",

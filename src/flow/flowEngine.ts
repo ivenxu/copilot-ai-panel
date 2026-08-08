@@ -22,6 +22,14 @@ import { getMaxToolRounds, getMaxToolCount } from '../config/flowSettings';
  * Separated from FlowParticipant to keep participant logic focused on request routing.
  */
 export class FlowEngine {
+	/**
+	 * Sentinel a role's response can contain to request that the flow stop
+	 * before any not-yet-run roles/stages/groups execute — the escape gate for
+	 * cases like a human-confirmation role reporting that the user declined to
+	 * proceed. Detected as a plain substring match against the role's final text.
+	 */
+	static readonly CANCEL_MARKER = '<!-- flow:cancel -->';
+
 	private readonly promptRenderer: FlowPromptRenderer;
 	private readonly sdkExecutor: CopilotSdkExecutor;
 	private readonly flowService: FlowService;
@@ -253,6 +261,11 @@ export class FlowEngine {
 				stream.markdown(`**Model: ${response.model}**\n\n`);
 			}
 			stream.markdown('---\n\n');
+
+			if (response.outcome === 'cancel') {
+				this.reportCancellation(stream, role.name);
+				return responses;
+			}
 		}
 
 		return responses;
@@ -375,6 +388,11 @@ export class FlowEngine {
 					}
 					stream.markdown('---\n\n');
 
+					if (response.outcome === 'cancel') {
+						this.reportCancellation(stream, role.name);
+						return responses;
+					}
+
 					runningContext = `${runningContext}\n\n**[${stage.name} / ${role.name}]**:\n${response.content}`;
 				}
 
@@ -421,10 +439,14 @@ export class FlowEngine {
 
 		// ── FORK: run each group independently ──────────────────────────────
 		const groupOutputs = new Map<string, string>();
+		let cancelledBy: string | undefined;
 
 		for (const group of groups) {
 			if (token.isCancellationRequested) {
 				return responses;
+			}
+			if (cancelledBy) {
+				break;
 			}
 
 			stream.markdown(`## Group: ${group.name}\n\n`);
@@ -482,6 +504,11 @@ export class FlowEngine {
 						stream.markdown(`**Model: ${response.model}**\n\n`);
 					}
 					stream.markdown('---\n\n');
+
+					if (response.outcome === 'cancel') {
+						cancelledBy = role.name;
+						break;
+					}
 				}
 
 				groupOutputs.set(group.name, groupOutput.trim());
@@ -495,6 +522,10 @@ export class FlowEngine {
 		}
 
 		if (token.isCancellationRequested) {
+			return responses;
+		}
+		if (cancelledBy) {
+			this.reportCancellation(stream, cancelledBy);
 			return responses;
 		}
 
@@ -543,6 +574,10 @@ export class FlowEngine {
 			stream.markdown(`**Model: ${joinResponse.model}**\n\n`);
 		}
 		stream.markdown('---\n\n');
+
+		if (joinResponse.outcome === 'cancel') {
+			this.reportCancellation(stream, join.name);
+		}
 
 		return responses;
 	}
@@ -603,6 +638,16 @@ export class FlowEngine {
 	// Role Execution
 	// ------------------------------------------------------------------
 
+	/** Detects the flow-cancel sentinel in a role's final response text. */
+	private deriveOutcome(content: string): 'cancel' | undefined {
+		return content.includes(FlowEngine.CANCEL_MARKER) ? 'cancel' : undefined;
+	}
+
+	/** Announces that the flow is stopping early because `roleName` requested cancellation. */
+	private reportCancellation(stream: vscode.ChatResponseStream, roleName: string): void {
+		stream.markdown(`\n> ⛔ **Flow cancelled by ${roleName}** — remaining steps skipped.\n\n`);
+	}
+
 	/**
 	 * Call a role using GitHub Copilot SDK
 	 */
@@ -638,9 +683,9 @@ export class FlowEngine {
 					stream.progress(message);
 				}
 			});
-			
-			return result;
-			
+
+			return { ...result, outcome: this.deriveOutcome(result.content) };
+
 		} catch (error) {
 			const errorMessage = error instanceof Error ? error.message : String(error);
 			this.log.error(error instanceof Error ? error : String(error), `Error in callRoleAgent for ${role.name}`);
@@ -748,9 +793,21 @@ export class FlowEngine {
 				}
 				
 				type ThinkingStream = { thinkingProgress: (d: { text?: string; id?: string; metadata?: Record<string, unknown> }) => void };
-				const thinkingStream = typeof (stream as unknown as ThinkingStream).thinkingProgress === 'function'
-					? (stream as unknown as ThinkingStream)
-					: undefined;
+				// `thinkingProgress` is always present on the stream object — VS Code gates it at
+				// call time, not by omitting the property — so a packaged (non-dev-mode) install
+				// without --enable-proposed-api still passes the typeof check and only throws when
+				// actually invoked. Guard every call and fall back to markdown once that happens.
+				let thinkingAvailable = typeof (stream as unknown as ThinkingStream).thinkingProgress === 'function';
+				const emitThinking = (d: { text?: string; id?: string; metadata?: Record<string, unknown> }): boolean => {
+					if (!thinkingAvailable) { return false; }
+					try {
+						(stream as unknown as ThinkingStream).thinkingProgress(d);
+						return true;
+					} catch {
+						thinkingAvailable = false;
+						return false;
+					}
+				};
 				const ThinkingPartCtor = (vscode as unknown as Record<string, unknown>)['LanguageModelThinkingPart'] as (new (...args: unknown[]) => unknown) | undefined;
 
 				const streamParts = async (req: vscode.LanguageModelChatResponse): Promise<{ text: string; calls: vscode.LanguageModelToolCallPart[] }> => {
@@ -762,7 +819,7 @@ export class FlowEngine {
 							if (token.isCancellationRequested) { break; }
 							if (part instanceof vscode.LanguageModelTextPart) {
 								if (thinkingActive) {
-									thinkingStream?.thinkingProgress({ id: '', text: '', metadata: { vscodeReasoningDone: true, stopReason: 'text' } });
+									emitThinking({ id: '', text: '', metadata: { vscodeReasoningDone: true, stopReason: 'text' } });
 									thinkingActive = false;
 								}
 								text += part.value;
@@ -782,8 +839,7 @@ export class FlowEngine {
 							} else if (ThinkingPartCtor && part instanceof ThinkingPartCtor) {
 								const thinkPart = part as { value: string | string[]; id?: string; metadata?: Record<string, unknown> };
 								const thinkText = Array.isArray(thinkPart.value) ? thinkPart.value.join('') : (thinkPart.value ?? '');
-								if (thinkingStream) {
-									thinkingStream.thinkingProgress({ text: thinkText, id: thinkPart.id, metadata: thinkPart.metadata });
+								if (emitThinking({ text: thinkText, id: thinkPart.id, metadata: thinkPart.metadata })) {
 									thinkingActive = true;
 								} else if (thinkText) {
 									stream.markdown(`> 💭 ${thinkText}\n`);
@@ -791,8 +847,7 @@ export class FlowEngine {
 							} else if ((part as object)?.constructor?.name === 'LanguageModelThinkingPart') {
 								const thinkPart = part as { value: string | string[]; id?: string; metadata?: Record<string, unknown> };
 								const thinkText = Array.isArray(thinkPart.value) ? thinkPart.value.join('') : (thinkPart.value ?? '');
-								if (thinkingStream) {
-									thinkingStream.thinkingProgress({ text: thinkText, id: thinkPart.id, metadata: thinkPart.metadata });
+								if (emitThinking({ text: thinkText, id: thinkPart.id, metadata: thinkPart.metadata })) {
 									thinkingActive = true;
 								} else if (thinkText) {
 									stream.markdown(`> 💭 ${thinkText}\n`);
@@ -800,7 +855,7 @@ export class FlowEngine {
 							}
 						}
 						if (thinkingActive) {
-							thinkingStream?.thinkingProgress({ id: '', text: '', metadata: { vscodeReasoningDone: true, stopReason: 'other' } });
+							emitThinking({ id: '', text: '', metadata: { vscodeReasoningDone: true, stopReason: 'other' } });
 						}
 					} catch (streamErr) {
 						this.log.error(streamErr instanceof Error ? streamErr : String(streamErr), `Stream error in round ${toolRound + 1}`);
@@ -891,7 +946,8 @@ export class FlowEngine {
 				roleName: role.name,
 				content: finalContent,
 				model: model.name,
-				touchedFiles: touchedFileUris.length > 0 ? touchedFileUris : undefined
+				touchedFiles: touchedFileUris.length > 0 ? touchedFileUris : undefined,
+				outcome: this.deriveOutcome(finalContent)
 			};
 			
 		} catch (error) {

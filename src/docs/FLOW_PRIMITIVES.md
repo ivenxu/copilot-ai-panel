@@ -106,6 +106,28 @@ Exactly one root key must be present. The parser rejects files that provide more
 
 ---
 
+## The Cancel Gate
+
+Any role — in any of the three patterns — can stop the flow before its not-yet-run roles/stages/groups execute, by including this exact sentinel anywhere in its final response text:
+
+```
+<!-- flow:cancel -->
+```
+
+This is the escape hatch for a **human-gate role**: a role whose prompt asks the user to confirm before continuing (e.g. "Reply with the marker below if I should NOT proceed: `<!-- flow:cancel -->`") and echoes the marker back when the user declines. Detection is a plain substring match — see `FlowEngine.CANCEL_MARKER`.
+
+Behaviour per pattern:
+
+| Pattern | On cancel |
+|---|---|
+| Pipeline (`roles:`) | Remaining roles are skipped. |
+| Iterative (`stages:`) | Remaining roles in the current iteration, remaining iterations of the current stage, and all later stages are skipped. |
+| Fork-Join (`groups:` + `join:`) | Remaining roles in the current group, remaining groups, and the `join` role are all skipped. |
+
+The role that requested cancellation still has its response recorded and displayed as normal; only steps that had not yet run are skipped. The chat stream shows `⛔ Flow cancelled by <Role Name>` at the point execution stopped.
+
+---
+
 ## The `delegate` Role Annotation
 
 `delegate: true` on a role routes its execution through the **GitHub Copilot SDK** (background agent) instead of the VS Code Language Model API.

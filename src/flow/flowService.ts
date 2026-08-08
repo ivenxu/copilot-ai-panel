@@ -44,6 +44,12 @@ export interface IRoleResponse {
 	readonly error?: string;
 	/** URIs of files created or modified by tool calls during this role's execution. */
 	readonly touchedFiles?: readonly vscode.Uri[];
+	/**
+	 * Set to `'cancel'` when the role's response contains the flow-cancel sentinel
+	 * (see `FlowEngine.CANCEL_MARKER`), signalling that no further steps should run —
+	 * e.g. a human-gate role reporting that the user declined to proceed.
+	 */
+	readonly outcome?: 'cancel';
 }
 
 /**

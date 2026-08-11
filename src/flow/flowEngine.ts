@@ -16,6 +16,7 @@ import { selectModel } from '../util/selectModel';
 import { refToUri } from '../util/refToUri';
 import { ILogger } from '../platform/log/common/logService';
 import { getMaxToolRounds, getMaxToolCount } from '../config/flowSettings';
+import { ThinkingPanelHelper } from './thinkingPanelHelper';
 
 /**
  * Flow execution engine - handles all execution strategies and prompt resolution.
@@ -740,7 +741,10 @@ export class FlowEngine {
 			// Track files created/modified by tool calls so callers can inject them
 			// as context into subsequent roles (e.g. reviewer sees the actual file).
 			const touchedFileUris: vscode.Uri[] = [];
-			
+			// One panel per role turn — reused across tool rounds so consecutive reasoning
+			// bursts render as a single grouped "thinking" panel instead of one per round.
+			const thinking = new ThinkingPanelHelper(stream, role.name);
+
 			while (toolRound < maxToolRounds) {
 				if (token.isCancellationRequested) {
 					break;
@@ -792,39 +796,22 @@ export class FlowEngine {
 					this.log.debug(`Using ${normalizedTools.length} tools`);
 				}
 				
-				type ThinkingStream = { thinkingProgress: (d: { text?: string; id?: string; metadata?: Record<string, unknown> }) => void };
-				// `thinkingProgress` is always present on the stream object — VS Code gates it at
-				// call time, not by omitting the property — so a packaged (non-dev-mode) install
-				// without --enable-proposed-api still passes the typeof check and only throws when
-				// actually invoked. Guard every call and fall back to markdown once that happens.
-				let thinkingAvailable = typeof (stream as unknown as ThinkingStream).thinkingProgress === 'function';
-				const emitThinking = (d: { text?: string; id?: string; metadata?: Record<string, unknown> }): boolean => {
-					if (!thinkingAvailable) { return false; }
-					try {
-						(stream as unknown as ThinkingStream).thinkingProgress(d);
-						return true;
-					} catch {
-						thinkingAvailable = false;
-						return false;
-					}
-				};
 				const ThinkingPartCtor = (vscode as unknown as Record<string, unknown>)['LanguageModelThinkingPart'] as (new (...args: unknown[]) => unknown) | undefined;
+				const isThinkingPart = (part: unknown): part is { value: string | string[]; id?: string; metadata?: Record<string, unknown> } =>
+					(ThinkingPartCtor && part instanceof ThinkingPartCtor) || (part as object)?.constructor?.name === 'LanguageModelThinkingPart';
 
 				const streamParts = async (req: vscode.LanguageModelChatResponse): Promise<{ text: string; calls: vscode.LanguageModelToolCallPart[] }> => {
 					const calls: vscode.LanguageModelToolCallPart[] = [];
 					let text = '';
-					let thinkingActive = false;
 					try {
 						for await (const part of req.stream) {
 							if (token.isCancellationRequested) { break; }
 							if (part instanceof vscode.LanguageModelTextPart) {
-								if (thinkingActive) {
-									emitThinking({ id: '', text: '', metadata: { vscodeReasoningDone: true, stopReason: 'text' } });
-									thinkingActive = false;
-								}
+								thinking.closeForText();
 								text += part.value;
 								stream.markdown(part.value);
 							} else if (part instanceof vscode.LanguageModelToolCallPart) {
+								thinking.closeForAction();
 								calls.push(part);
 								stream.progress(`🔧 ${part.name}(...)`);
 								this.log.trace(`Received tool call: ${part.name} (callId: ${part.callId})`);
@@ -836,27 +823,12 @@ export class FlowEngine {
 										stream.markdown(decoded);
 									} catch { /* ignore */ }
 								}
-							} else if (ThinkingPartCtor && part instanceof ThinkingPartCtor) {
-								const thinkPart = part as { value: string | string[]; id?: string; metadata?: Record<string, unknown> };
-								const thinkText = Array.isArray(thinkPart.value) ? thinkPart.value.join('') : (thinkPart.value ?? '');
-								if (emitThinking({ text: thinkText, id: thinkPart.id, metadata: thinkPart.metadata })) {
-									thinkingActive = true;
-								} else if (thinkText) {
-									stream.markdown(`> 💭 ${thinkText}\n`);
-								}
-							} else if ((part as object)?.constructor?.name === 'LanguageModelThinkingPart') {
-								const thinkPart = part as { value: string | string[]; id?: string; metadata?: Record<string, unknown> };
-								const thinkText = Array.isArray(thinkPart.value) ? thinkPart.value.join('') : (thinkPart.value ?? '');
-								if (emitThinking({ text: thinkText, id: thinkPart.id, metadata: thinkPart.metadata })) {
-									thinkingActive = true;
-								} else if (thinkText) {
-									stream.markdown(`> 💭 ${thinkText}\n`);
-								}
+							} else if (isThinkingPart(part)) {
+								const thinkText = Array.isArray(part.value) ? part.value.join('') : (part.value ?? '');
+								thinking.pushDelta(thinkText);
 							}
 						}
-						if (thinkingActive) {
-							emitThinking({ id: '', text: '', metadata: { vscodeReasoningDone: true, stopReason: 'other' } });
-						}
+						thinking.closeForAction();
 					} catch (streamErr) {
 						this.log.error(streamErr instanceof Error ? streamErr : String(streamErr), `Stream error in round ${toolRound + 1}`);
 						stream.markdown(`\n> ❌ **Stream error (${role.name})**: ${String(streamErr)}\n\n`);
